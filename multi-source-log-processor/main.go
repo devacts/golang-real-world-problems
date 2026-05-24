@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -21,7 +23,7 @@ func createLogEntry(source string, sev string, message string) LogEntry {
 	}
 }
 
-func EmitWebServerLogs(out chan LogEntry, done chan bool) {
+func EmitWebServerLogs(ctx context.Context, out chan LogEntry) {
 	ticker := time.NewTicker(time.Millisecond * 100)
 	defer ticker.Stop()
 	warn := time.After(2 * time.Second)
@@ -31,13 +33,13 @@ func EmitWebServerLogs(out chan LogEntry, done chan bool) {
 			out <- createLogEntry("web-server", "INFO", "Pinging Log Server")
 		case <-warn:
 			out <- createLogEntry("web-server", "WARN", "Pong not received since 2 seconds")
-		case <-done:
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func EmitAuthServiceLogs(out chan LogEntry, done chan bool) {
+func EmitAuthServiceLogs(ctx context.Context, out chan LogEntry) {
 	ticker := time.NewTicker(time.Millisecond * 200)
 	defer ticker.Stop()
 	err := time.After(2 * time.Second)
@@ -47,8 +49,7 @@ func EmitAuthServiceLogs(out chan LogEntry, done chan bool) {
 			out <- createLogEntry("auth-service", "INFO", "Pinging Log Server")
 		case <-err:
 			out <- createLogEntry("auth-service", "ERR", "Pong not received since 2 seconds")
-			return
-		case <-done:
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -64,15 +65,26 @@ func printEmitLogs(out chan LogEntry) {
 func main() {
 
 	out := make(chan LogEntry, 3)
-	done := make(chan bool, 2)
-	go EmitWebServerLogs(out, done)
-	go EmitAuthServiceLogs(out, done)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
 
-	go printEmitLogs(out)
+	var wge, wgp sync.WaitGroup
+	wge.Go(func() {
+		EmitWebServerLogs(ctx, out)
+	})
+	wge.Go(func() {
+		EmitAuthServiceLogs(ctx, out)
+	})
 
-	time.Sleep(5 * time.Second)
-	done <- true
-	done <- true
+	wgp.Add(1)
+	go func() {
+		defer wgp.Done()
+		printEmitLogs(out)
+	}()
+
+	wge.Wait()
 	close(out)
+	wgp.Wait()
+
 	fmt.Println("Exiting...")
 }
