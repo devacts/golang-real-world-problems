@@ -7,14 +7,39 @@ import (
 	"time"
 )
 
+type SEVERITY string
+
+const (
+	INFO  SEVERITY = "INFO"
+	WARN  SEVERITY = "WARN"
+	ERROR SEVERITY = "ERROR"
+)
+
 type LogEntry struct {
 	Source    string
-	Severity  string
+	Severity  SEVERITY
 	Message   string
 	Timestamp time.Time
 }
 
-func createLogEntry(source string, sev string, message string) LogEntry {
+type SourceStats struct {
+	sevInfoCount int
+	sevWarnCount int
+	sevErrCount  int
+}
+
+type SafeStats struct {
+	statsMu           sync.Mutex
+	sourceLogCountMap map[string]SourceStats
+}
+
+func NewSafeStats() *SafeStats {
+	return &SafeStats{
+		sourceLogCountMap: make(map[string]SourceStats),
+	}
+}
+
+func createLogEntry(source string, sev SEVERITY, message string) LogEntry {
 	return LogEntry{
 		Source:    source,
 		Severity:  sev,
@@ -30,9 +55,9 @@ func EmitWebServerLogs(ctx context.Context, out chan LogEntry) {
 	for {
 		select {
 		case <-ticker.C:
-			out <- createLogEntry("web-server", "INFO", "Pinging Log Server")
+			out <- createLogEntry("web-server", INFO, "Pinging Log Server")
 		case <-warn:
-			out <- createLogEntry("web-server", "WARN", "Pong not received since 2 seconds")
+			out <- createLogEntry("web-server", WARN, "Pong not received since 2 seconds")
 		case <-ctx.Done():
 			return
 		}
@@ -46,19 +71,49 @@ func EmitAuthServiceLogs(ctx context.Context, out chan LogEntry) {
 	for {
 		select {
 		case <-ticker.C:
-			out <- createLogEntry("auth-service", "INFO", "Pinging Log Server")
+			out <- createLogEntry("auth-service", INFO, "Pinging Log Server")
 		case <-err:
-			out <- createLogEntry("auth-service", "ERR", "Pong not received since 2 seconds")
+			out <- createLogEntry("auth-service", ERROR, "Pong not received since 2 seconds")
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func printEmitLogs(out chan LogEntry) {
+func (s *SafeStats) printSevCountPerSourcePerSecond(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.statsMu.Lock()
+			for source, sevCounts := range s.sourceLogCountMap {
+				fmt.Printf("Source %s sev counts = %v\n", source, sevCounts)
+				s.sourceLogCountMap[source] = SourceStats{0, 0, 0}
+			}
+			s.statsMu.Unlock()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *SafeStats) processEmitLogs(out chan LogEntry) {
 	for log := range out {
-		fmt.Printf("log received from service :%s with Severity: %s\n", log.Source, log.Severity)
-		fmt.Println(log.Message)
+		s.statsMu.Lock()
+		ss := s.sourceLogCountMap[log.Source]
+		switch log.Severity {
+		case INFO:
+			ss.sevInfoCount++
+			s.sourceLogCountMap[log.Source] = ss
+		case WARN:
+			ss.sevWarnCount++
+			s.sourceLogCountMap[log.Source] = ss
+		case ERROR:
+			ss.sevErrCount++
+			s.sourceLogCountMap[log.Source] = ss
+		}
+		s.statsMu.Unlock()
 	}
 }
 
@@ -68,7 +123,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 
-	var wge, wgp sync.WaitGroup
+	var wge, wgp, wgpr sync.WaitGroup
 	wge.Go(func() {
 		EmitWebServerLogs(ctx, out)
 	})
@@ -76,15 +131,23 @@ func main() {
 		EmitAuthServiceLogs(ctx, out)
 	})
 
+	s := NewSafeStats()
 	wgp.Add(1)
 	go func() {
 		defer wgp.Done()
-		printEmitLogs(out)
+		s.processEmitLogs(out)
 	}()
+
+	printContext, printCancel := context.WithCancel(context.Background())
+	wgpr.Go(func() {
+		s.printSevCountPerSourcePerSecond(printContext)
+	})
 
 	wge.Wait()
 	close(out)
 	wgp.Wait()
+	printCancel()
+	wgpr.Wait()
 
 	fmt.Println("Exiting...")
 }
